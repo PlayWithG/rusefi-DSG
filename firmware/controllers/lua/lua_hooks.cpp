@@ -14,6 +14,7 @@
 #include "start_stop.h"
 #include "tinymt32.h" // TL,DR: basic implementation of 'random'
 #include "signaldebounce.h"
+#include "torque_estimator.h"
 
 #if EFI_PROD_CODE && HW_HELLEN
 #include "hellen_meta.h"
@@ -1024,6 +1025,58 @@ extern int luaCommandCounters[LUA_BUTTON_COUNT];
 		engine->engineState.lua.torqueReductionState = lua_toboolean(l, 1);
 		return 0;
 	});
+
+	// getInstantTorque() -> number
+	// Returns current estimated engine torque in Nm using VE table + MAP sensor.
+	// Includes IAT density correction when torqueEstimationIatCorrectionEnabled is set.
+	// Use this for real-time CAN transmission to DSG/TCU instead of the Lua torque table.
+	lua_register(lState, "getInstantTorque", [](lua_State* l) {
+		lua_pushnumber(l, getInstantTorque());
+		return 1;
+	});
+
+#if EFI_LAUNCH_CONTROL
+	// setRpmMatchTarget(targetRpm)
+	// Start RPM matching for a downshift. The firmware will apply ignition advance
+	// boost proportional to the error (targetRpm - actualRpm) until matched or timeout.
+	lua_register(lState, "setRpmMatchTarget", [](lua_State* l) {
+		float targetRpm = luaL_checknumber(l, 1);
+		engine->rpmMatchController.setTargetRpm(targetRpm);
+		return 0;
+	});
+
+	// getRpmMatchState() -> integer
+	// Returns: 0 = inactive, 1 = matching (in progress),
+	//          2 = matched (RPM within tolerance), 3 = timeout
+	lua_register(lState, "getRpmMatchState", [](lua_State* l) {
+		int state;
+		if (!engine->rpmMatchController.isRpmMatchActive) {
+			state = 0;
+		} else if (engine->rpmMatchController.isRpmMatchTimeout) {
+			state = 3;
+		} else if (engine->rpmMatchController.isRpmMatchSuccess) {
+			state = 2;
+		} else {
+			state = 1;
+		}
+		lua_pushinteger(l, state);
+		return 1;
+	});
+
+	// getRpmMatchError() -> number
+	// Returns targetRpm - currentRpm. Positive = RPM below target, negative = overshoot.
+	lua_register(lState, "getRpmMatchError", [](lua_State* l) {
+		lua_pushnumber(l, engine->rpmMatchController.rpmMatchError);
+		return 1;
+	});
+
+	// cancelRpmMatch()
+	// Stop RPM matching immediately (e.g. TCU cancelled the downshift request).
+	lua_register(lState, "cancelRpmMatch", [](lua_State* l) {
+		engine->rpmMatchController.cancel();
+		return 0;
+	});
+#endif // EFI_LAUNCH_CONTROL
 
 	lua_register(lState, "getCalibration", [](lua_State* l) {
 		auto propertyName = luaL_checklstring(l, 1, nullptr);

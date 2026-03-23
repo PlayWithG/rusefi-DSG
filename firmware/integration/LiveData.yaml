@@ -89,6 +89,13 @@ Usages:
     constexpr: "engine->shiftTorqueReductionController"
     conditional_compilation: "EFI_LAUNCH_CONTROL"
 
+  - name: rpm_match_state
+    cppFileName: rpm_match_controller
+    java: RpmMatchController.java
+    folder: controllers/algo
+    constexpr: "engine->rpmMatchController"
+    conditional_compilation: "EFI_LAUNCH_CONTROL"
+
   - name: antilag_system_state
     cppFileName: antilag_system
     java: AntilagSystem.java

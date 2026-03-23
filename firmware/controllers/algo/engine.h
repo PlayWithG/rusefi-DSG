@@ -33,6 +33,7 @@
 #include "injector_model.h"
 #include "launch_control.h"
 #include "shift_torque_reduction_controller.h"
+#include "rpm_match_controller.h"
 #include "nitrous_controller.h"
 #include "antilag_system.h"
 #include "start_stop.h"
@@ -223,6 +224,7 @@ public:
 #if EFI_LAUNCH_CONTROL
     LaunchControlBase launchController{};
     ShiftTorqueReductionController shiftTorqueReductionController{};
+    RpmMatchController rpmMatchController{};
     SoftSparkLimiter softSparkLimiter{false};
     // technically not directly related to EFI_LAUNCH_CONTROL since useful for TCU
     SoftSparkLimiter hardSparkLimiter{true};

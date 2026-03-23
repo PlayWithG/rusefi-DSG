@@ -1,0 +1,16 @@
+struct_no_prefix rpm_match_state_s
+
+bit isRpmMatchActive
+bit isRpmMatchSuccess
+bit isRpmMatchTimeout
+
+! Target RPM requested by Lua (from TCU downshift request)
+float rpmMatchTarget
+
+! Current error: target - actual RPM (positive = RPM below target)
+float rpmMatchError
+
+! Advance boost currently being applied (degrees)
+float rpmMatchCurrentAdvanceBoost
+
+end_struct

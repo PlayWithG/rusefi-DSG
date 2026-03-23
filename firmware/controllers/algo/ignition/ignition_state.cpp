@@ -132,6 +132,11 @@ angle_t getRunningAdvance(float rpm, float engineLoad) {
 	) {
 		return engine->shiftTorqueReductionController.getTorqueReductionIgnitionRetard();
 	}
+	// RPM match for downshifts: add advance to blip RPM toward target sync speed.
+	// Mutually exclusive with torque reduction above (one is upshift, other is downshift).
+	if (engineConfiguration->rpmMatchEnabled) {
+		advanceAngle += engine->rpmMatchController.getIgnitionAdvanceBoost();
+	}
     if (engineConfiguration->nitrousControlEnabled && engine->module<NitrousController>()->isNitrousCondition) {
         advanceAngle -= engineConfiguration->nitrousIgnitionRetard;
     }

@@ -34,6 +34,18 @@ TCU_BUS = 1
 
 fakeTorque = 0
 
+-- DSG shift state tracking
+isUpshiftPending   = false
+isDownshiftPending = false
+rpmMatchWasActive  = false
+
+-- Gear ratio table (edit to match your DSG: e.g. 6-speed DQ250)
+-- gearRatios[n] = internal ratio for gear n (without finalDrive)
+-- Used to compute target RPM for downshift sync.
+gearRatios = { 3.500, 1.960, 1.320, 0.974, 0.771, 0.609 }
+finalDrive  = 3.647   -- final drive ratio (adjust to your vehicle)
+wheelRevPerKm = 489.0 -- adjust to match your tire size (e.g. 205/55R16 ≈ 489 rev/km)
+
 hexstr = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, "A", "B", "C", "D", "E", "F" }
 
 function toHexString(num)
@@ -119,17 +131,71 @@ function getBitRange(data, bitIndex, bitWidth)
 	return (value >> shift) & mask
 end
 
-counter440 = 0
-function onTcu1(bus, id, dlc, data)
---	print("onTcu1")
-	    isShiftActive = getBitRange(data, 0, 1)
-        tcuStatus = getBitRange(data, 1, 1)
-        EGSRequirement = getBitRange(data, 7, 1)
+-- Compute target RPM for the given gear number at the current vehicle speed.
+-- targetGear: 1-based gear index into gearRatios table.
+function computeTargetRpm(targetGear)
+	local vssKph = getSensor("VehicleSpeed") or 0
+	if vssKph < 5 then
+		return 0
+	end
+	local ratio = gearRatios[targetGear]
+	if ratio == nil then
+		return 0
+	end
+	-- wheelRpm = vssKph * wheelRevPerKm / 60
+	-- driveshaftRpm = wheelRpm * finalDrive
+	-- engineRpm = driveshaftRpm * gearRatio
+	local wheelRpm = vssKph * wheelRevPerKm / 60.0
+	return wheelRpm * finalDrive * ratio
+end
 
-            counter440 = counter440 + 1
-            if counter440 % 1 == 0 then
-                print("TCU " .. isShiftActive .. " " .. tcuStatus .. " " .. EGSRequirement)
-            end
+counter440 = 0
+prevShiftActive = 0
+prevEGSRequirement = 0
+
+function onTcu1(bus, id, dlc, data)
+	isShiftActive    = getBitRange(data, 0, 1)
+	tcuStatus        = getBitRange(data, 1, 1)
+	-- Bit 4: upshift request, Bit 5: downshift request (VAG DSG protocol)
+	upshiftRequest   = getBitRange(data, 4, 1)
+	downshiftRequest = getBitRange(data, 5, 1)
+	EGSRequirement   = getBitRange(data, 7, 1)
+
+	-- Upshift: activate torque reduction so the clutch pack can engage cleanly.
+	if upshiftRequest == 1 and prevShiftActive == 0 then
+		setTorqueReductionState(true)
+		isUpshiftPending = true
+		isDownshiftPending = false
+	end
+
+	-- Downshift: calculate target RPM for sync and activate RPM match.
+	if downshiftRequest == 1 and prevShiftActive == 0 then
+		local currentGear = getSensor("DetectedGear") or 0
+		local targetGear  = currentGear - 1
+		if targetGear >= 1 then
+			local targetRpm = computeTargetRpm(targetGear)
+			if targetRpm > 500 then
+				setRpmMatchTarget(targetRpm)
+				isDownshiftPending = true
+				isUpshiftPending   = false
+			end
+		end
+	end
+
+	-- Shift completed: release all overrides.
+	if isShiftActive == 0 and prevShiftActive == 1 then
+		setTorqueReductionState(false)
+		cancelRpmMatch()
+		isUpshiftPending   = false
+		isDownshiftPending = false
+	end
+
+	prevShiftActive = isShiftActive
+
+	counter440 = counter440 + 1
+	if counter440 % 50 == 0 then
+		print("TCU shift=" .. isShiftActive .. " up=" .. upshiftRequest .. " dn=" .. downshiftRequest .. " egs=" .. EGSRequirement)
+	end
 end
 
 motor1Data   = { 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }
@@ -163,35 +229,39 @@ canRxAdd(TCU_1344_540, onTcu2)
 rpm = 0
 
 function sendMotor1()
-	engineTorque = fakeTorque * 0.9
-	innerTorqWithoutExt = fakeTorque
-	torqueLoss = 20
-	requestedTorque = fakeTorque
+	-- Use firmware real-time torque estimation (VE + MAP + IAT correction).
+	-- Falls back to TPS-based estimate when reference params are not configured.
+	local estimatedTorque = getInstantTorque()
+	if estimatedTorque < 1 then
+		-- Fallback: simple TPS-linear estimate while reference params are tuned in.
+		estimatedTorque = interpolate(0, 6, 100, 60, tps)
+	end
 
-	motor1Data[2] = engineTorque / 0.39
+	fakeTorque = estimatedTorque
+
+	-- engineTorque: output shaft torque (after accessories, ~90% of indicated)
+	local engineTorque       = estimatedTorque * 0.9
+	-- innerTorqWithoutExt: indicated engine torque before drivetrain losses
+	local innerTorqWithoutExt = estimatedTorque
+	-- torqueLoss: friction + pumping + accessory losses (fixed 20 Nm, tune as needed)
+	local torqueLoss          = 20
+	-- requestedTorque: driver demand (matches inner torque here)
+	local requestedTorque     = estimatedTorque
+
+	motor1Data[2] = math.floor(engineTorque / 0.39)
 	setTwoBytes(motor1Data, 2, rpm / 0.25)
-	motor1Data[5] = innerTorqWithoutExt / 0.4
-	motor1Data[6] = tps / 0.4
-	motor1Data[7] = torqueLoss / 0.39
-	motor1Data[8] = requestedTorque / 0.39
-
--- print ('MOTOR_1 fakeTorque ' ..fakeTorque)
--- print ('MOTOR_1 engineTorque ' ..engineTorque ..' RPM ' ..rpm)
--- print ('MOTOR_1 innerTorqWithoutExt ' ..innerTorqWithoutExt ..' tps ' ..tps)
-
--- print ('MOTOR_1 torqueLoss ' ..torqueLoss ..' requestedTorque ' ..requestedTorque)
+	motor1Data[5] = math.floor(innerTorqWithoutExt / 0.4)
+	motor1Data[6] = math.floor(tps / 0.4)
+	motor1Data[7] = math.floor(torqueLoss / 0.39)
+	motor1Data[8] = math.floor(requestedTorque / 0.39)
 
 	txCan(TCU_BUS, MOTOR_1, 0, motor1Data)
 end
 
 
 function onMotor1(bus, id, dlc, data)
-
 	rpm = math.floor(getSensor("RPM") + 0.5)
 	tps = getSensor("TPS1") or 0
-
-	fakeTorque = interpolate(0, 6, 100, 60, tps)
-
 	sendMotor1()
 end
 
@@ -199,12 +269,22 @@ function sendMotor3()
 	iat = getSensor("IAT") or 0
 	tps = getSensor("TPS1") or 0
 
-	desired_wheel_torque = fakeTorque
-	canMotor3[2] = (iat + 48) / 0.75
-	canMotor3[3] = tps / 0.4
+	-- desired_wheel_torque: what the TCU uses for shift load calculation.
+	-- During RPM match (downshift) report reduced torque so TCU allows engagement.
+	local desired_wheel_torque = fakeTorque
+	if isDownshiftPending then
+		local matchState = getRpmMatchState()
+		if matchState == 2 then
+			-- RPM matched: signal low torque so TCU proceeds with clutch engagement.
+			desired_wheel_torque = fakeTorque * 0.3
+		end
+	end
+
+	canMotor3[2] = math.floor((iat + 48) / 0.75)
+	canMotor3[3] = math.floor(tps / 0.4)
 	canMotor3[5] = 0x20
 	setBitRange(canMotor3, 24, 12, math.floor(desired_wheel_torque / 0.39))
-	canMotor3[8] = tps / 0.4
+	canMotor3[8] = math.floor(tps / 0.4)
 	txCan(TCU_BUS, MOTOR_3, 0, canMotor3)
 end
 
@@ -254,9 +334,9 @@ motor6counter = 0
 function sendMotor6()
 	motor6counter = (motor6counter + 1) % 16
 
-	engineTorque = fakeTorque * 0.9
-	actualTorque = fakeTorque
-	feedbackGearbox = 255
+	local engineTorque  = fakeTorque * 0.9
+	local actualTorque  = fakeTorque
+	local feedbackGearbox = 255
 
 	motor6Data[2] = math.floor(engineTorque / 0.39)
 	motor6Data[3] = math.floor(actualTorque / 0.39)
