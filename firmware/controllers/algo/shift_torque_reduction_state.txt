@@ -2,11 +2,16 @@ struct_no_prefix shift_torque_reduction_state_s
 
 bit isTorqueReductionTriggerPinValid
 bit torqueReductionTriggerPinState
-bit isTimeConditionSatisfied
 bit isRpmConditionSatisfied
 bit isAppConditionSatisfied
 bit isFlatShiftConditionSatisfied
 bit isBelowTemperatureThreshold
+
+! 0=IDLE 1=REDUCING 2=HOLD 3=RECOVERY
+uint8_t torqueReductionPhase
+
+! Degrees of retard currently subtracted from base advance
+float torqueReductionCurrentRetard
 
 int16_t trqRedCutXaxisValue
 int16_t trqRedTimeXaxisValue

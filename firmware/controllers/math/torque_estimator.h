@@ -12,4 +12,9 @@ void estimateTorqueTable();
 //   IAT sensor — intake air temperature density correction (if enabled in config)
 //
 // This value is suitable for real-time CAN transmission to a DSG TCU.
+// Applies a low-pass filter (alpha = torqueEstimationFilterAlpha in config).
 float getInstantTorque();
+
+// Raw (unfiltered) torque estimate at current RPM/MAP/IAT.
+// Use for diagnostics or when you need immediate response.
+float getRawInstantTorque();

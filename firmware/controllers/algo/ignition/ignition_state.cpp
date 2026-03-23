@@ -127,13 +127,15 @@ angle_t getRunningAdvance(float rpm, float engineLoad) {
 			return launchAngle;
 		}
 	}
+	// Upshift torque reduction: subtract retard OFFSET from base advance.
+	// Safe: base advance is preserved so the engine never goes to 0° advance.
 	if (engineConfiguration->torqueReductionEnabled
 		&& engine->shiftTorqueReductionController.isFlatShiftConditionSatisfied
 	) {
-		return engine->shiftTorqueReductionController.getTorqueReductionIgnitionRetard();
+		advanceAngle -= engine->shiftTorqueReductionController.getCurrentRetardOffset();
 	}
-	// RPM match for downshifts: add advance to blip RPM toward target sync speed.
-	// Mutually exclusive with torque reduction above (one is upshift, other is downshift).
+	// Downshift RPM match: small secondary advance boost.
+	// Primary blip mechanism is ETB (setEtbAdd in Lua). This is auxiliary.
 	if (engineConfiguration->rpmMatchEnabled) {
 		advanceAngle += engine->rpmMatchController.getIgnitionAdvanceBoost();
 	}

@@ -34,17 +34,43 @@ TCU_BUS = 1
 
 fakeTorque = 0
 
--- DSG shift state tracking
-isUpshiftPending   = false
-isDownshiftPending = false
-rpmMatchWasActive  = false
+-- ===========================================================================
+-- VEHICLE-SPECIFIC CALIBRATION — adjust to your DSG DQ250 build
+-- ===========================================================================
+-- DQ250 6-speed gear ratios (ratio = engine_rpm / driveshaft_rpm in each gear)
+local GEAR_RATIOS    = { 3.500, 1.960, 1.320, 0.974, 0.771, 0.609 }
+local FINAL_DRIVE    = 3.647    -- rear/front differential final drive ratio
+local WHEEL_REV_PER_KM = 489.0  -- wheel revolutions per km (e.g. 205/55R16)
 
--- Gear ratio table (edit to match your DSG: e.g. 6-speed DQ250)
--- gearRatios[n] = internal ratio for gear n (without finalDrive)
--- Used to compute target RPM for downshift sync.
-gearRatios = { 3.500, 1.960, 1.320, 0.974, 0.771, 0.609 }
-finalDrive  = 3.647   -- final drive ratio (adjust to your vehicle)
-wheelRevPerKm = 489.0 -- adjust to match your tire size (e.g. 205/55R16 ≈ 489 rev/km)
+-- ===========================================================================
+-- RPM MATCH (DOWNSHIFT ETB BLIP) CALIBRATION
+-- ===========================================================================
+local RPM_MATCH_MAX_ETB_ADD     = 15.0   -- max throttle % added during blip
+local RPM_MATCH_PEDAL_THRESHOLD =  8.0   -- % pedal: no blip if driver is on gas
+local RPM_MATCH_RPM_DELTA_MIN   = 150    -- RPM: no blip if delta smaller than this
+local RPM_MATCH_TIMEOUT_MS      = 1500   -- ms: abort if RPM not matched in time
+local RPM_MATCH_RAMP_RATE       =  2.5   -- % ETB added per onTick call (~300 Hz)
+local RPM_MATCH_RPM_TOLERANCE   =  80    -- RPM: success band around target
+
+-- ===========================================================================
+-- SHIFT STATE MACHINE
+-- All shift state is in a single table to avoid global variable pollution
+-- and to make the logic explicit and collision-free.
+-- ===========================================================================
+local shiftState = {
+    phase     = "IDLE",  -- "IDLE" / "UPSHIFT" / "DOWNSHIFT"
+    prevActive = 0,
+    timer     = Timer.new(),
+    TIMEOUT_MS = 3000,   -- safety: release overrides if TCU never signals completion
+}
+
+-- RPM match sub-state (active only during DOWNSHIFT phase)
+local rpmMatch = {
+    phase     = "IDLE",  -- "IDLE"/"DECIDING"/"BLIPPING"/"HOLDING"/"REMOVING"/"DONE"
+    targetRpm = 0,
+    etbAdd    = 0,
+    timer     = Timer.new(),
+}
 
 hexstr = { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, "A", "B", "C", "D", "E", "F" }
 
@@ -76,18 +102,20 @@ function onTcu2(bus, id, dlc, data)
 --	print("onTcu2")
 end
 
+-- FIX: all intermediate variables are local to avoid global scope pollution
+-- and to make recursive calls safe (bitsToHandleNow, mask, etc.)
 function setBitRange(data, totalBitIndex, bitWidth, value)
 	local byteIndex = totalBitIndex >> 3
 	local bitInByteIndex = totalBitIndex - byteIndex * 8
 	if (bitInByteIndex + bitWidth > 8) then
-		bitsToHandleNow = 8 - bitInByteIndex
+		local bitsToHandleNow = 8 - bitInByteIndex
 		setBitRange(data, totalBitIndex + bitsToHandleNow, bitWidth - bitsToHandleNow, value >> bitsToHandleNow)
 		bitWidth = bitsToHandleNow
 	end
-	mask = (1 << bitWidth) - 1
+	local mask = (1 << bitWidth) - 1
 	data[1 + byteIndex] = data[1 + byteIndex] & (~(mask << bitInByteIndex))
-	maskedValue = value & mask
-	shiftedValue = maskedValue << bitInByteIndex
+	local maskedValue = value & mask
+	local shiftedValue = maskedValue << bitInByteIndex
 	data[1 + byteIndex] = data[1 + byteIndex] | shiftedValue
 end
 
@@ -120,81 +148,168 @@ function xorChecksum(data, targetIndex)
 	return result
 end
 
+-- FIX: all variables are local
 function getBitRange(data, bitIndex, bitWidth)
-	byteIndex = bitIndex >> 3
-	shift = bitIndex - byteIndex * 8
-	value = data[1 + byteIndex]
+	local byteIndex = bitIndex >> 3
+	local shift = bitIndex - byteIndex * 8
+	local value = data[1 + byteIndex]
 	if (shift + bitWidth > 8) then
 		value = value + data[2 + byteIndex] * 256
 	end
-	mask = (1 << bitWidth) - 1
+	local mask = (1 << bitWidth) - 1
 	return (value >> shift) & mask
 end
 
--- Compute target RPM for the given gear number at the current vehicle speed.
--- targetGear: 1-based gear index into gearRatios table.
-function computeTargetRpm(targetGear)
+-- ---------------------------------------------------------------------------
+-- computeTargetRpm: RPM the engine should reach before downshift clutch engages.
+-- targetGear: 1-based index into GEAR_RATIOS table.
+-- ---------------------------------------------------------------------------
+local function computeTargetRpm(targetGear)
 	local vssKph = getSensor("VehicleSpeed") or 0
-	if vssKph < 5 then
-		return 0
-	end
-	local ratio = gearRatios[targetGear]
-	if ratio == nil then
-		return 0
-	end
-	-- wheelRpm = vssKph * wheelRevPerKm / 60
-	-- driveshaftRpm = wheelRpm * finalDrive
+	if vssKph < 5 then return 0 end
+	local ratio = GEAR_RATIOS[targetGear]
+	if ratio == nil then return 0 end
+	-- wheelRpm = vssKph * WHEEL_REV_PER_KM / 60
+	-- driveshaftRpm = wheelRpm * FINAL_DRIVE
 	-- engineRpm = driveshaftRpm * gearRatio
-	local wheelRpm = vssKph * wheelRevPerKm / 60.0
-	return wheelRpm * finalDrive * ratio
+	local wheelRpm = vssKph * WHEEL_REV_PER_KM / 60.0
+	return wheelRpm * FINAL_DRIVE * ratio
 end
 
-counter440 = 0
-prevShiftActive = 0
-prevEGSRequirement = 0
+-- ---------------------------------------------------------------------------
+-- abortShift: release all engine overrides immediately.
+-- Called on shift completion, timeout, or abort conditions.
+-- ---------------------------------------------------------------------------
+local function abortShift()
+	setTorqueReductionState(false)
+	cancelRpmMatch()
+	setEtbAdd(0)
+	rpmMatch.phase  = "IDLE"
+	rpmMatch.etbAdd = 0
+	shiftState.phase = "IDLE"
+end
 
-function onTcu1(bus, id, dlc, data)
-	isShiftActive    = getBitRange(data, 0, 1)
-	tcuStatus        = getBitRange(data, 1, 1)
-	-- Bit 4: upshift request, Bit 5: downshift request (VAG DSG protocol)
-	upshiftRequest   = getBitRange(data, 4, 1)
-	downshiftRequest = getBitRange(data, 5, 1)
-	EGSRequirement   = getBitRange(data, 7, 1)
+-- ---------------------------------------------------------------------------
+-- rpmMatchTick: ETB blip state machine — called every onTick (~300 Hz).
+-- Only active during DOWNSHIFT phase.
+-- ---------------------------------------------------------------------------
+local function rpmMatchTick()
+	if rpmMatch.phase == "IDLE" then return end
 
-	-- Upshift: activate torque reduction so the clutch pack can engage cleanly.
-	if upshiftRequest == 1 and prevShiftActive == 0 then
-		setTorqueReductionState(true)
-		isUpshiftPending = true
-		isDownshiftPending = false
+	local currentRpm = getSensor("Rpm") or 0
+	local pedal      = getSensor("AcceleratorPedalPrimary") or getSensor("Tps1") or 0
+	local error      = rpmMatch.targetRpm - currentRpm
+
+	-- ABORT: driver pressed accelerator or global timeout
+	if pedal > RPM_MATCH_PEDAL_THRESHOLD
+		or rpmMatch.timer:getElapsedMs() > RPM_MATCH_TIMEOUT_MS then
+		setEtbAdd(0)
+		cancelRpmMatch()
+		rpmMatch.phase  = "IDLE"
+		rpmMatch.etbAdd = 0
+		return
 	end
 
-	-- Downshift: calculate target RPM for sync and activate RPM match.
-	if downshiftRequest == 1 and prevShiftActive == 0 then
-		local currentGear = getSensor("DetectedGear") or 0
-		local targetGear  = currentGear - 1
-		if targetGear >= 1 then
-			local targetRpm = computeTargetRpm(targetGear)
-			if targetRpm > 500 then
-				setRpmMatchTarget(targetRpm)
-				isDownshiftPending = true
-				isUpshiftPending   = false
+	if rpmMatch.phase == "DECIDING" then
+		if error < RPM_MATCH_RPM_DELTA_MIN then
+			-- RPM already close enough — skip blip, go straight to done
+			rpmMatch.phase = "DONE"
+		else
+			rpmMatch.phase = "BLIPPING"
+		end
+
+	elseif rpmMatch.phase == "BLIPPING" then
+		-- Proportional open: more ETB when further from target, capped at max
+		local targetEtb = RPM_MATCH_MAX_ETB_ADD * math.min(error / 500.0, 1.0)
+		targetEtb = math.max(targetEtb, 0)
+		rpmMatch.etbAdd = math.min(rpmMatch.etbAdd + RPM_MATCH_RAMP_RATE, targetEtb)
+		setEtbAdd(rpmMatch.etbAdd)
+		-- Also inform firmware RPM match module for live data / advance boost
+		setRpmMatchTarget(rpmMatch.targetRpm)
+		if error < RPM_MATCH_RPM_TOLERANCE then
+			rpmMatch.phase = "HOLDING"
+		end
+
+	elseif rpmMatch.phase == "HOLDING" then
+		-- Maintain ETB while RPM stabilizes; firmware confirms via getRpmMatchState()
+		if getRpmMatchState() == 2 or error < RPM_MATCH_RPM_TOLERANCE then
+			rpmMatch.phase = "REMOVING"
+		elseif error > RPM_MATCH_RPM_TOLERANCE * 2 then
+			-- RPM dropped back, keep blipping
+			rpmMatch.phase = "BLIPPING"
+		end
+
+	elseif rpmMatch.phase == "REMOVING" then
+		-- Ramp down ETB smoothly to avoid torque spike on clutch engagement
+		rpmMatch.etbAdd = math.max(rpmMatch.etbAdd - RPM_MATCH_RAMP_RATE, 0)
+		setEtbAdd(rpmMatch.etbAdd)
+		if rpmMatch.etbAdd <= 0 then
+			rpmMatch.phase = "DONE"
+		end
+	end
+	-- "DONE": stay here until abortShift() resets state (shift complete signal)
+end
+
+-- ---------------------------------------------------------------------------
+-- onTcu1: CAN callback for TCU gear shift requests (0x440)
+-- FIX: all local variables — no global state pollution from this callback.
+-- FIX: elseif prevents simultaneous upshift+downshift activation.
+-- FIX: safety timeout so we don't stay stuck if TCU never sends shift_complete.
+-- ---------------------------------------------------------------------------
+local counter440 = 0
+
+function onTcu1(bus, id, dlc, data)
+	-- Use local variables — CAN callbacks run asynchronously
+	local isShiftActive    = getBitRange(data, 0, 1)
+	local upshiftRequest   = getBitRange(data, 4, 1)
+	local downshiftRequest = getBitRange(data, 5, 1)
+
+	-- ---- Rising edge: new shift request ----
+	if shiftState.prevActive == 0 and isShiftActive == 1 then
+		shiftState.timer:reset()
+
+		-- FIX: elseif — upshift has priority; both cannot activate simultaneously
+		if upshiftRequest == 1 then
+			-- UPSHIFT: firmware torque reduction handles timing retard + spark skip
+			setTorqueReductionState(true)
+			shiftState.phase = "UPSHIFT"
+
+		elseif downshiftRequest == 1 then
+			-- DOWNSHIFT: compute RPM target and start ETB blip state machine
+			local currentGear = math.floor(getSensor("DetectedGear") or 0)
+			local targetGear  = currentGear - 1
+			if targetGear >= 1 then
+				local targetRpm = computeTargetRpm(targetGear)
+				if targetRpm > 500 then
+					rpmMatch.targetRpm = targetRpm
+					rpmMatch.etbAdd    = 0
+					rpmMatch.phase     = "DECIDING"
+					rpmMatch.timer:reset()
+					shiftState.phase   = "DOWNSHIFT"
+				end
 			end
 		end
 	end
 
-	-- Shift completed: release all overrides.
-	if isShiftActive == 0 and prevShiftActive == 1 then
-		setTorqueReductionState(false)
-		cancelRpmMatch()
-		isUpshiftPending   = false
-		isDownshiftPending = false
+	-- ---- Falling edge: shift completed ----
+	if shiftState.prevActive == 1 and isShiftActive == 0 then
+		abortShift()
 	end
 
-	prevShiftActive = isShiftActive
+	shiftState.prevActive = isShiftActive
+
+	-- ---- Safety timeout: if TCU never signals completion ----
+	if shiftState.phase ~= "IDLE"
+		and shiftState.timer:getElapsedMs() > shiftState.TIMEOUT_MS then
+		abortShift()
+	end
 
 	counter440 = counter440 + 1
 	if counter440 % 50 == 0 then
-		print("TCU shift=" .. isShiftActive .. " up=" .. upshiftRequest .. " dn=" .. downshiftRequest .. " egs=" .. EGSRequirement)
+		print("TCU active=" .. isShiftActive
+			.. " up=" .. upshiftRequest
+			.. " dn=" .. downshiftRequest
+			.. " phase=" .. shiftState.phase)
 	end
 end
 
@@ -260,24 +375,22 @@ end
 
 
 function onMotor1(bus, id, dlc, data)
-	rpm = math.floor(getSensor("RPM") + 0.5)
-	tps = getSensor("TPS1") or 0
+	rpm = math.floor(getSensor("Rpm") + 0.5)
+	tps = getSensor("Tps1") or 0
 	sendMotor1()
 end
 
 function sendMotor3()
-	iat = getSensor("IAT") or 0
-	tps = getSensor("TPS1") or 0
+	local iat = getSensor("Iat") or 0
+	local tps = getSensor("Tps1") or 0
 
 	-- desired_wheel_torque: what the TCU uses for shift load calculation.
-	-- During RPM match (downshift) report reduced torque so TCU allows engagement.
+	-- During RPM match (downshift): report reduced torque once RPM is matched
+	-- so the TCU knows it's safe to engage the clutch pack.
 	local desired_wheel_torque = fakeTorque
-	if isDownshiftPending then
-		local matchState = getRpmMatchState()
-		if matchState == 2 then
-			-- RPM matched: signal low torque so TCU proceeds with clutch engagement.
-			desired_wheel_torque = fakeTorque * 0.3
-		end
+	if shiftState.phase == "DOWNSHIFT"
+		and (rpmMatch.phase == "HOLDING" or rpmMatch.phase == "REMOVING" or rpmMatch.phase == "DONE") then
+		desired_wheel_torque = fakeTorque * 0.3
 	end
 
 	canMotor3[2] = math.floor((iat + 48) / 0.75)
@@ -303,16 +416,13 @@ motor2counter = 0
 function sendMotor2()
 	motor2counter = (motor2counter + 1) % 16
 
-	minTorque = fakeTorque / 2
-	-- todo: add CLT
+	local minTorque = fakeTorque / 2
 	motor2Data[7] = math.floor(minTorque / 0.39)
 
---print ( "brake " .. getBitRange(data, 16, 2) .. " " .. rpm)
-
-	brakeBit = rpm < 2000 and 1 or 0
+	local brakeBit = rpm < 2000 and 1 or 0
 	setBitRange(motor2Data, 16, 1, brakeBit)
 
-	index = math.floor(motor2counter / 4)
+	local index = math.floor(motor2counter / 4)
 	motor2Data[1] = motor2mux[1 + index]
 
 	txCan(TCU_BUS, MOTOR_2, 0, motor2Data)
@@ -322,10 +432,9 @@ motor5counter = 0
 motor5FuelCounter = 0
 function sendMotor5()
     motor5counter = (motor5counter + 1) % 16
-	index = math.floor(motor5counter / 4)
+	local index = math.floor(motor5counter / 4)
 	motor5Data[1] = motor5mux[1 + index]
 
---	setBitRange(motor5Data, 5, 9, motor5FuelCounter)
 	xorChecksum(motor5Data, 8)
 	txCan(TCU_BUS, MOTOR_5, 0, motor5Data)
 end
@@ -361,11 +470,11 @@ function sendMotorInfo()
 	canMotorInfoTotalCounter = canMotorInfoTotalCounter + 1
 	canMotorInfoCounter = (canMotorInfoCounter + 1) % 16
 
-	baseByte = canMotorInfoTotalCounter < 6 and 0x80 or 0x90
-	canMotorInfo[1] = baseByte + (canMotorInfoCounter)
-	canMotorInfo1[1] = baseByte + (canMotorInfoCounter)
-	canMotorInfo3[1] = baseByte + (canMotorInfoCounter)
-	mod4 = canMotorInfoCounter % 4
+	local baseByte = canMotorInfoTotalCounter < 6 and 0x80 or 0x90
+	canMotorInfo[1]  = baseByte + canMotorInfoCounter
+	canMotorInfo1[1] = baseByte + canMotorInfoCounter
+	canMotorInfo3[1] = baseByte + canMotorInfoCounter
+	local mod4 = canMotorInfoCounter % 4
 
 	if (mod4 == 0 or mod4 == 2) then
 		txCan(TCU_BUS, MOTOR_INFO, 0, canMotorInfo)
@@ -518,17 +627,20 @@ canRxAdd(VWTP_IN, onCanHello)
 --txCan(1, VWTP_OUT, 0, { 0x02, 0xC0, 0x00, 0x10, 0x00, 0x03, 0x01 })
 
 function onTick()
-
-	freqValue = getSensor("AuxSpeed1") or 0
-	mafValue = curve(mafCalibrationIndex, 5)
-	-- 	print(freqValue .. " mafValue=" .. mafValue)
+	local freqValue = getSensor("AuxSpeed1") or 0
+	local mafValue  = curve(mafCalibrationIndex, 5)
 	mafSensor : set(mafValue)
 
-	rpm = getSensor("RPM") or 0
-	vbat = getSensor("BatteryVoltage") or 0
+	rpm  = getSensor("Rpm") or 0
+	local vbat = getSensor("BatteryVoltage") or 0
 
 	if rpm == 0 then
 		canMotorInfoTotalCounter = 0
+	end
+
+	-- Run RPM match blip state machine every tick
+	if shiftState.phase == "DOWNSHIFT" then
+		rpmMatchTick()
 	end
 
 	onMotor1(0, 0, 0, nil)

@@ -1027,11 +1027,17 @@ extern int luaCommandCounters[LUA_BUTTON_COUNT];
 	});
 
 	// getInstantTorque() -> number
-	// Returns current estimated engine torque in Nm using VE table + MAP sensor.
-	// Includes IAT density correction when torqueEstimationIatCorrectionEnabled is set.
-	// Use this for real-time CAN transmission to DSG/TCU instead of the Lua torque table.
+	// Returns low-pass filtered torque estimate (Nm). Suitable for CAN transmission to DSG TCU.
+	// Filter alpha set by torqueEstimationFilterAlpha config param (default 0.1).
 	lua_register(lState, "getInstantTorque", [](lua_State* l) {
 		lua_pushnumber(l, getInstantTorque());
+		return 1;
+	});
+
+	// getRawTorque() -> number
+	// Returns unfiltered instantaneous torque estimate (Nm). Use for diagnostics.
+	lua_register(lState, "getRawTorque", [](lua_State* l) {
+		lua_pushnumber(l, getRawInstantTorque());
 		return 1;
 	});
 

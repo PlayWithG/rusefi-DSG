@@ -1224,10 +1224,14 @@ float referenceTorqueForGenerator
 float referenceMapForGenerator
 float referenceVeForGenerator
 float torqueEstimationReferenceIat;Reference intake air temperature used for torque density correction. Torque is scaled by (referenceIAT_K / actualIAT_K).;"degC", 1, 0, -40, 60, 1
+float torqueEstimationFilterAlpha;Low-pass filter coefficient for real-time torque estimate. Lower = smoother but slower to respond. 0.1 is a good starting point for DSG.;"", 1, 0, 0.01, 1.0, 2
 
 float rpmMatchRpmTolerance;RPM tolerance for declaring a successful downshift RPM match. Smaller = tighter sync, larger = easier to satisfy.;"RPM", 1, 0, 20, 500, 0
 float rpmMatchTimeout;Maximum time the RPM match is allowed to run before flagging a timeout. Prevents stuck-active state if TCU cancelled the shift.;"ms", 1, 0, 200, 5000, 0
-float rpmMatchMaxAdvanceBoost;Maximum ignition advance (degrees) added during RPM match to blip the engine. Keep modest to avoid detonation.;"deg", 1, 0, 0, 15, 1
+float rpmMatchMaxAdvanceBoost;Maximum ignition advance (degrees) added during RPM match as secondary support for non-ETB setups.;"deg", 1, 0, 0, 10, 1
+
+float torqueReductionRampInRate;Degrees of ignition retard added per fast callback tick (~100 Hz) during the REDUCING phase. Higher = faster torque cut.;"deg/step", 1, 0, 0.1, 15.0, 1
+float torqueReductionRampOutRate;Degrees of ignition retard removed per fast callback tick during the RECOVERY phase. Lower = slower/smoother return.;"deg/step", 1, 0, 0.1, 10.0, 1
 
 custom pin_mode_e 1 bits, U08, @OFFSET@, [0:6], $pin_mode_e_enum
 

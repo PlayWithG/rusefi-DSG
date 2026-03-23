@@ -1,13 +1,11 @@
 //
-// RPM Match Controller — raises engine RPM to synchronise with target gear
-// before DSG downshift clutch engagement.
+// RPM Match Controller — tracks downshift RPM sync state for TunerStudio live data.
 //
-// Strategy:
-//   error = targetRpm - currentRpm
-//   If error > 0 (RPM below target), add proportional ignition advance boost.
-//   Advance boost is capped by rpmMatchMaxAdvanceBoost (config).
-//   Success when |error| <= rpmMatchRpmTolerance for two consecutive updates.
-//   Timeout when rpmMatchTimeout ms has elapsed without matching.
+// Primary blip mechanism: ETB add (setEtbAdd) managed from Lua (vw_b6.lua).
+// This firmware module provides:
+//   - State visibility in TunerStudio
+//   - A small secondary advance boost for non-ETB setups (optional)
+//   - Timeout safety net
 //
 
 #include "pch.h"
@@ -26,7 +24,7 @@ void RpmMatchController::update() {
 		return;
 	}
 
-	// Timeout check
+	// Safety timeout — in case Lua forgets to cancel
 	if (m_matchTimer.hasElapsedMs(engineConfiguration->rpmMatchTimeout)) {
 		isRpmMatchActive = false;
 		isRpmMatchTimeout = true;
@@ -42,21 +40,19 @@ void RpmMatchController::update() {
 
 	if (fabsf(rpmMatchError) <= tolerance) {
 		isRpmMatchSuccess = true;
-		// Stay active until Lua explicitly cancels so it can read the success state.
 		rpmMatchCurrentAdvanceBoost = 0;
 		return;
 	}
 
 	isRpmMatchSuccess = false;
 
+	// Secondary advance boost: very small, only when RPM is significantly below target.
+	// Primary mechanism is ETB add in Lua. Keep this at <= 5° to avoid detonation risk.
 	if (rpmMatchError > 0) {
-		// RPM below target: apply proportional advance boost.
-		// Full boost kicks in at 500 RPM below target, scales linearly below that.
-		float maxBoost = engineConfiguration->rpmMatchMaxAdvanceBoost;
-		float normalizedError = minF(rpmMatchError / 500.0f, 1.0f);
-		rpmMatchCurrentAdvanceBoost = maxBoost * normalizedError;
+		float maxBoost = minF(engineConfiguration->rpmMatchMaxAdvanceBoost, 5.0f);
+		float normalized = minF(rpmMatchError / 500.0f, 1.0f);
+		rpmMatchCurrentAdvanceBoost = maxBoost * normalized;
 	} else {
-		// RPM above target (overshoot): no boost, let RPM settle.
 		rpmMatchCurrentAdvanceBoost = 0;
 	}
 }

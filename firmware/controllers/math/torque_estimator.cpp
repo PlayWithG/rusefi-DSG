@@ -49,7 +49,9 @@ void estimateTorqueTable() {
 	}
 }
 
-float getInstantTorque() {
+static float s_filteredTorque = 0.0f;
+
+float getRawInstantTorque() {
 	if (engineConfiguration->referenceMapForGenerator <= 0 ||
 	    engineConfiguration->referenceVeForGenerator  <= 0 ||
 	    engineConfiguration->referenceTorqueForGenerator <= 0) {
@@ -65,13 +67,32 @@ float getInstantTorque() {
 		config->veRpmBins, rpm
 	);
 
-	// Base torque: scales with VE and manifold pressure
 	float torque = engineConfiguration->referenceTorqueForGenerator
 		* (ve  / engineConfiguration->referenceVeForGenerator)
 		* (map / engineConfiguration->referenceMapForGenerator);
 
-	// IAT density correction
 	torque *= getIatTorqueCorrectionFactor();
 
 	return maxF(torque, 0.0f);
+}
+
+// Returns a low-pass filtered torque estimate.
+// The LPF smooths sensor noise so the DSG TCU receives a stable signal.
+// alpha = torqueEstimationFilterAlpha (0.01=very smooth … 1.0=no filter).
+float getInstantTorque() {
+	float raw = getRawInstantTorque();
+
+	float alpha = engineConfiguration->torqueEstimationFilterAlpha;
+	// Guard against uninitialized config (alpha=0 would freeze the output)
+	if (alpha <= 0.0f || alpha > 1.0f) {
+		alpha = 0.1f;
+	}
+
+	if (s_filteredTorque == 0.0f) {
+		s_filteredTorque = raw;  // cold-start: seed filter with first real value
+	} else {
+		s_filteredTorque = alpha * raw + (1.0f - alpha) * s_filteredTorque;
+	}
+
+	return s_filteredTorque;
 }
